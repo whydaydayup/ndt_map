@@ -23,8 +23,8 @@ loop-closure disabled trajectory
 
 ### Input
 
-- Point Cloud(`/lslidar_point_cloud`)
-- Odometry(`/odom/imu`)
+- Point Cloud(`/lslidar_point_cloud`) 修改为velodyne_points
+- Odometry(`/odom/imu`) 修改为/gps/odom这个是utm坐标系的odometer,这个转换不会
 - Imu(`/imu/data`)
 - TF: /base_link -> /laser, /odom -> /base_link(`/tf`)
 

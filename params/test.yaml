@@ -1,5 +1,5 @@
-use_odom: true
-use_imu: true
+use_odom: false #true
+use_imu: false
 keyframe_dist: 0.3
 min_scan_range: 1
 max_scan_range: 70

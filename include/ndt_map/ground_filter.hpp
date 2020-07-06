@@ -42,7 +42,7 @@ private:
     double minY;
     double maxY;
 
-    double MIN_DISTANCE; // default: 2.4
+    double MIN_DISTANCE; // default: 2.4 // min_point_distance_最近点的距离
 
     double concentric_divider_distance_; // default: 0.01 //0.1 meters default
     double min_height_threshold_; // default: 0.05
@@ -79,7 +79,7 @@ public:
     {
         SENSOR_MODEL = 16;
         // SENSOR_HEIGHT = 0.37;
-        SENSOR_HEIGHT = 0.4;
+        SENSOR_HEIGHT = 0.4;// TODO:  ??原来的sensor_height_, 1.7 // 传感器的高度，默认1.7米
         local_max_slope_ = 8.0;
         general_max_slope_ = 7.0;
         min_height_threshold_ = 0.05;
@@ -97,23 +97,25 @@ public:
     };
 
     ~RayGroundFilter(){};
+    // 截取clip_height高度以上的点云
     void clip_above(double clip_height, const pcl::PointCloud<PointNoI>::Ptr in,
         const pcl::PointCloud<PointNoI>::Ptr out,
         const pcl::PointIndices::Ptr up_indices)
     {
+        // ExtractIndices类实现点云子集提取，这里创建一个提取的类
         pcl::ExtractIndices<PointNoI> cliper;
-
-        cliper.setInputCloud(in);
+        cliper.setInputCloud(in);// 输入点云
         pcl::PointIndices indices;
 #pragma omp for // #pragma omp for语法OpenMP的并行化语法，即希望通过OpenMP并行化执行这条语句后的for循环，从而起到加速的效果。
         for (size_t i = 0; i < in->points.size(); i++) {
             if (in->points[i].z > clip_height) {
                 indices.indices.push_back(i);
-                up_indices->indices.push_back(i);
+                up_indices->indices.push_back(i);// 遍历所有的点，将z方向大于in_clip_height的点的序号装入indices索引内
             }
         }
         cliper.setIndices(boost::make_shared<pcl::PointIndices>(indices));
-        cliper.setNegative(true); //ture to remove the indices
+        // 这里移除了z方向大于in_clip_height的点,out_clippered_cloud_ptr内只剩下小于in_clip_height的点云
+        cliper.setNegative(true); //true removes the indices移除index指定的点, false leaves only the indices保留index指定的点
         cliper.filter(*out);
     }
 
@@ -279,13 +281,24 @@ public:
             }
         }
     }
-
+    // using PointNoI = pcl::PointXYZI;
     void convert(const pcl::PointCloud<PointNoI>::Ptr& current_pc_ptr,
         const pcl::PointCloud<PointNoI>::Ptr& no_ground_cloud_ptr)
     {
         pcl::PointIndices::Ptr up_indices(new pcl::PointIndices());
-        up_indices->indices.clear();
+        // std::vector<int> indices;    
+        /* vector.clear()函数并不会把所有元素清零。
+        vector有两个参数，一个是size，表示当前vector容器内存储的元素个数，一个是capacity，表示当前vector在内存中申请的这片区域所能容纳的元素个数。
+        通常capacity会比size大，如果往vector中push_back数据，这样就不用重新申请内存和拷贝元素到新内存区域了，便于节省时间。
+        如果想要清零vector的话，还是得重新定义一个vector，或者用assign函数，
+        vector<vector<int>>res(12,vector<int>(12,0));
+        res.assign(12,vector<int>(12,0));//assign先删除掉res中的所有元素，接着插入12个vector<int>(12,0)，时间花费还是大了点
+	    //res=vector<vector<int>>(12,0);//或者直接定义一个新的，赋给res。
+        */
+        up_indices->indices.clear(); // vector.clear()：把size设置成0，capacity不变
         pcl::PointCloud<PointNoI>::Ptr cliped_pc_ptr(new pcl::PointCloud<PointNoI>());
+        // 输入的点云是current_pc_ptr，移除了所有高于CLIP_HEIGHT高度的点，
+        // 移除高于一定高度的点云后的点云保存在cliped_pc_ptr中，up_indices保存所有高于CLIP_HEIGHT高度的点的序号
         clip_above(CLIP_HEIGHT, current_pc_ptr, cliped_pc_ptr, up_indices);
 
         pcl::PointCloud<PointNoI>::Ptr up_pc_ptr(new pcl::PointCloud<PointNoI>);
@@ -293,7 +306,7 @@ public:
         extract_adove.setInputCloud(current_pc_ptr);
         extract_adove.setIndices(boost::make_shared<pcl::PointIndices>(*up_indices));
         extract_adove.setNegative(false); //true removes the indices, false save the indices
-        extract_adove.filter(*up_pc_ptr);
+        extract_adove.filter(*up_pc_ptr);// up_pc_ptr保存的是 高于CLIP_HEIGHT高度的点云
 
         pcl::PointCloud<PointNoI>::Ptr remove_close(new pcl::PointCloud<PointNoI>);
         remove_close_pt(MIN_DISTANCE, cliped_pc_ptr, remove_close, nullptr);

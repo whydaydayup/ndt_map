@@ -9,8 +9,26 @@
  * 
  */
 
+/*
+[pcl::IterativeClosestPoint::setInputTarget] Invalid or empty point cloud dataset given!
+[pcl::registration::IterativeClosestPoint::compute] No input target dataset was given!
+ */
+
 #include "ndt_map/ndt_map.h"
 
+// 计算相邻帧航向角yaw的变化函数 diff_yaw = calcDiffForRadian(current_pose.yaw, previous_pose.yaw);
+static double calcDiffForRadian(const double lhs_rad, const double rhs_rad)
+{
+    double diff_rad = lhs_rad - rhs_rad; // 当前帧 航向角 - 上一帧 航向角
+    if (diff_rad >= M_PI)
+        diff_rad = diff_rad - 2 * M_PI;
+    else if (diff_rad < -M_PI)
+        diff_rad = diff_rad + 2 * M_PI;
+    return diff_rad;
+}
+
+
+// 正常的建图的线程
 NDTMap::NDTMap(ros::NodeHandle nh, ros::NodeHandle pnh) : nh_(nh), pnh_(pnh)
 {
   pnh_.param<float>("scan_period", scan_period_, 0.2);
@@ -18,44 +36,48 @@ NDTMap::NDTMap(ros::NodeHandle nh, ros::NodeHandle pnh) : nh_(nh), pnh_(pnh)
   keyframe_dist_ *= keyframe_dist_;
   pnh_.param<float>("surround_search_radius", surround_search_radius_, 20.);
   pnh_.param<int>("surround_search_num", surround_search_num_, 50);
-  pnh_.param<float>("voxel_leaf_size", voxel_leaf_size_, 2.);
-  pnh_.param<float>("min_scan_range", min_scan_range_, 2);
+  pnh_.param<float>("voxel_leaf_size", voxel_leaf_size_, 1.);// voxel降采样，默认2
+  pnh_.param<float>("min_scan_range", min_scan_range_, 2);// 最小检测距离，默认2
   min_scan_range_ *= min_scan_range_;
-  pnh_.param<float>("max_scan_range", max_scan_range_, 70);
+  pnh_.param<float>("max_scan_range", max_scan_range_, 100);// 最大检测距离默认70
   max_scan_range_ *= max_scan_range_;
   pnh_.param<bool>("use_odom", use_odom_, true);
-  pnh_.param<bool>("use_imu", use_imu_, true);
-  pnh_.param<bool>("loop_closure_enabled", loop_closure_enabled_, true);
-
+  pnh_.param<bool>("use_imu", use_imu_, true); // 基于LOAM的匀速运动假设，使用IMU去畸变
+  pnh_.param<bool>("loop_closure_enabled", loop_closure_enabled_, true);// 回环开关
+  // NDT参数
   pnh_.param<double>("trans_eps", trans_eps_, 0.01);
   pnh_.param<double>("step_size", step_size, 0.1);
   pnh_.param<double>("ndt_res", ndt_res_, 1.);
   pnh_.param<int>("max_iters", max_iters_, 30);
-
+  // 回环参数
   pnh_.param<float>("history_search_radius", history_search_radius_, 10.);
   pnh_.param<int>("history_search_num", history_search_num_, 20);
   pnh_.param<float>("history_fitness_score", history_fitness_score_, 0.3);
-  pnh_.param<float>("ds_history_size", ds_history_size_, 1.);
-
+  pnh_.param<float>("ds_history_size", ds_history_size_, 1.);// voxel降采样
+  // 保存的目录
   pnh_.param<std::string>("save_dir", save_dir_, "");
 
-  tf_b2l_ = Eigen::Matrix4f::Identity();
+  // Eigen::Matrix4f tf_b2l_;
+  tf_b2l_ = Eigen::Matrix4f::Identity();// 单位矩阵
   float roll, pitch, yaw;
+  // /base_link --> /localizer的转换，
   if (!nh_.getParam("tf_b2l_x", tf_b2l_(0, 3)) || !nh_.getParam("tf_b2l_y", tf_b2l_(1, 3)) || !nh_.getParam("tf_b2l_z", tf_b2l_(2, 3)) || !nh_.getParam("tf_b2l_roll", roll) || !nh_.getParam("tf_b2l_pitch", pitch) || !nh_.getParam("tf_b2l_yaw", yaw))
   {
     ROS_ERROR("transform between /base_link to /laser not set.");
     exit(-1);
   }
+  // 轴角，绕着XYZ轴旋转Roll，Pitch，yaw角度
   Eigen::AngleAxisf rx(roll, Eigen::Vector3f::UnitX());
   Eigen::AngleAxisf ry(pitch, Eigen::Vector3f::UnitY());
   Eigen::AngleAxisf rz(yaw, Eigen::Vector3f::UnitZ());
+  // 将0,0开始的3x3的矩阵 赋值
   tf_b2l_.block(0, 0, 3, 3) = (rz * ry * rx).matrix();
 
-  if (!init())
+  if (!init()) // 初始化
   {
     exit(-1);
   }
-
+	// 发布的消息
   pub_keyposes_ = nh_.advertise<sensor_msgs::PointCloud2>("/keyposes", 1);
   pub_laser_cloud_surround_ = nh_.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surround", 1);
   pub_undistorted_pc_ = nh_.advertise<sensor_msgs::PointCloud2>("/undistorted_pc", 1);
@@ -65,34 +87,80 @@ NDTMap::NDTMap(ros::NodeHandle nh, ros::NodeHandle pnh) : nh_(nh), pnh_(pnh)
   pub_history_keyframes_ = nh_.advertise<sensor_msgs::PointCloud2>("/history_keyframes", 1);
   pub_recent_keyframes_ = nh_.advertise<sensor_msgs::PointCloud2>("/recent_keyframes", 1);
   pub_icp_keyframes_ = nh_.advertise<sensor_msgs::PointCloud2>("/icp_keyframes", 1);
-
+	// service服务函数，来保存地图数据
   srv_save_map_ = nh_.advertiseService("/save_map", &NDTMap::saveMapCB, this);
-
-  sub_pc_ = nh_.subscribe<sensor_msgs::PointCloud2>("/lslidar_point_cloud", 5, boost::bind(&NDTMap::pcCB, this, _1));
+	// 订阅的消息
+  sub_pc_ = nh_.subscribe<sensor_msgs::PointCloud2>("/velodyne_points", 5, boost::bind(&NDTMap::pcCB, this, _1));
   sub_imu_ = nh_.subscribe<sensor_msgs::Imu>("/imu/data", 5, boost::bind(&NDTMap::imuCB, this, _1));
-  sub_odom_ = nh_.subscribe<nav_msgs::Odometry>("/odom/imu", 5, boost::bind(&NDTMap::odomCB, this, _1));
+  sub_odom_ = nh_.subscribe<nav_msgs::Odometry>("/gps/imu", 5, boost::bind(&NDTMap::odomCB, this, _1));
 }
-
+// ndtmap初始化
 bool NDTMap::init()
 {
-  ISAM2Params params;
-  params.relinearizeThreshold = 0.01;
-  params.relinearizeSkip = 1;
-  isam = new ISAM2(params);
+    previous_pose.x = 0.0;
+    previous_pose.y = 0.0;
+    previous_pose.z = 0.0;
+    previous_pose.roll = 0.0;
+    previous_pose.pitch = 0.0;
+    previous_pose.yaw = 0.0;
+    //
+    ndt_pose.x = 0.0;
+    ndt_pose.y = 0.0;
+    ndt_pose.z = 0.0;
+    ndt_pose.roll = 0.0;
+    ndt_pose.pitch = 0.0;
+    ndt_pose.yaw = 0.0;
+    // 当前位姿  current_pose = ndt_pose;
+    current_pose.x = 0.0;
+    current_pose.y = 0.0;
+    current_pose.z = 0.0;
+    current_pose.roll = 0.0;
+    current_pose.pitch = 0.0;
+    current_pose.yaw = 0.0;
+
+    // 只使用激光雷达时，进行NDT估计的初始位姿
+    guess_pose.x = 0.0;
+    guess_pose.y = 0.0;
+    guess_pose.z = 0.0;
+    guess_pose.roll = 0.0;
+    guess_pose.pitch = 0.0;
+    guess_pose.yaw = 0.0;
+    // 判断是否更新地图时，上一次更新地图时的位姿
+    added_pose.x = 0.0;
+    added_pose.y = 0.0;
+    added_pose.z = 0.0;
+    added_pose.roll = 0.0;
+    added_pose.pitch = 0.0;
+    added_pose.yaw = 0.0;
+    // 前后两帧之间的变化
+    diff_x = 0.0;
+    diff_y = 0.0;
+    diff_z = 0.0;
+    diff_yaw = 0.0;
+
+
+  // 用于闭环图优化的参数设置，使用gtsam库,    iSAM2参数
+  ISAM2Params params;//在定义ISAM2实例的时候存储参数的。
+  params.relinearizeThreshold = 0.01; // 默认0.1
+  params.relinearizeSkip = 1;/// < Only relinearize any variables every relinearizeSkip calls to ISAM2::update (default: 10)
+  isam = new ISAM2(params);// 创建一个ISAM2实例
   gtsam::Vector vector6(6);
   vector6 << 1e-6, 1e-6, 1e-6, 1e-8, 1e-8, 1e-6;
-  prior_noise_ = noiseModel::Diagonal::Variances(vector6);
+  // 噪声定义，对角线噪声模型，通过指定一个向量的方差
+  prior_noise_ = noiseModel::Diagonal::Variances(vector6);// 对角线噪声
   odom_noise_ = noiseModel::Diagonal::Variances(vector6);
-
+  // ndt设置
   cpu_ndt_.setTransformationEpsilon(trans_eps_);
   cpu_ndt_.setResolution(ndt_res_);
   cpu_ndt_.setStepSize(step_size);
   cpu_ndt_.setMaximumIterations(max_iters_);
-
+  // 设置voxel降采样参数
   voxel_filter_.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
   ds_source_.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
   ds_history_keyframes_.setLeafSize(ds_history_size_, ds_history_size_, ds_history_size_);
 
+  // int imu_ptr_front_, imu_ptr_last_, imu_ptr_last_iter_;
+  // int odom_ptr_front_, odom_ptr_last_, odom_ptr_last_iter_;
   imu_ptr_front_ = odom_ptr_front_ = 0;
   imu_ptr_last_ = odom_ptr_last_ = -1;
   imu_ptr_last_iter_ = odom_ptr_last_iter_ = 0;
@@ -101,10 +169,10 @@ bool NDTMap::init()
 
   tf_m2o_.setIdentity();
 
-  loop_closed_ = false;
+  loop_closed_ = false;// ？？？？啥变量？？？
 
-  ground_filter.setIfClipHeight(false);
-  ground_filter.setMinDistance(1.0);
+  ground_filter.setIfClipHeight(false);// 是否截取掉高于雷达自身xx米的点，默认是20米
+  ground_filter.setMinDistance(1.0);// 移除给定xx距离的内的点
 
   pc_source_.reset(new pcl::PointCloud<PointT>());
   pc_target_.reset(new pcl::PointCloud<PointT>());
@@ -117,7 +185,8 @@ bool NDTMap::init()
 
   kdtree_poses_.reset(new pcl::KdTreeFLANN<PointT>());
 
-  imu_time_.fill(0);
+  // std::array<double, imu_queue_len_> imu_time_;
+  imu_time_.fill(0);// fill(0)将整个array中的所有元素全部置为0
   imu_roll_.fill(0);
   imu_pitch_.fill(0);
   imu_yaw_.fill(0);
@@ -151,16 +220,17 @@ void NDTMap::visualThread()
   while (ros::ok())
   {
     publishKeyposesAndFrames();
-    duration.sleep();
+    duration.sleep();// 每2.5秒发布一次关键位姿和帧数据
   }
 }
 
 /**
- * @brief 参考 loam 的点云去运动畸变（基于匀速运动假设）
+ * @brief 参考 loam 的点云去运动畸变（基于匀速运动假设）这里使用的是匀加速运动模型，若不适用IMU应该用的是匀速运动模型去畸变
  * 
  */
 void NDTMap::adjustDistortion(pcl::PointCloud<PointT>::Ptr &cloud, double scan_time)
 {
+    // loam中把所有的点云数据全部映射到每个线号上，然后去每个点云的畸变
   bool half_passed = false;
   int cloud_size = cloud->points.size();
 
@@ -282,7 +352,7 @@ void NDTMap::adjustDistortion(pcl::PointCloud<PointT>::Ptr &cloud, double scan_t
     imu_ptr_last_iter_ = imu_ptr_front_;
   }
 
-  if (pub_undistorted_pc_.getNumSubscribers() > 0)
+  if (pub_undistorted_pc_.getNumSubscribers() > 0) // 发布去畸变后的点云数据"/undistorted_pc"
   {
     sensor_msgs::PointCloud2 msg;
     pcl::toROSMsg(*cloud, msg);
@@ -293,29 +363,36 @@ void NDTMap::adjustDistortion(pcl::PointCloud<PointT>::Ptr &cloud, double scan_t
 }
 
 /**
- * @brief 提取附近点云作为 target map。
+ * @brief 提取附近点云作为 target map进行NDT匹配。
  * 在 loop_closure_enabled_ = false 的情况下目前不需要提取，因为可以通过 updateVoxelGrid 更新 target map
- * 
+ *
  */
 void NDTMap::extractSurroundKeyframes()
 {
-  if (cloud_keyframes_.empty())
+    // if(cloudKeyPoses3D为空) return；
+    // cloudKeyPoses3D是保存了机器人在建图过程中轨迹，这里一般是刚开始建图，没有轨迹
+  if (cloud_keyframes_.empty()) // 关键帧点云为空
   {
     return;
   }
 
   bool target_updated = false;
-  if (loop_closure_enabled_)
+  if (loop_closure_enabled_)// 开启回环检测
   {
+      // std::deque<pcl::PointCloud<PointT>::Ptr> recent_keyframes_;
+      // 1.recent_keyframes_保存的点云数量太少，则清空后重新塞入新的点云直至数量够
+      // surround_search_num_ = 50;
     if (recent_keyframes_.size() < surround_search_num_)
     {
       recent_keyframes_.clear();
       for (int i = cloud_keyposes_3d_->points.size() - 1; i >= 0; --i)
       {
+          // cloudKeyPoses3D的intensity中存的是索引值,保存的索引值从0开始编号；
         int this_key_id = int(cloud_keyposes_3d_->points[i].intensity);
         pcl::PointCloud<PointT>::Ptr tf_cloud(new pcl::PointCloud<PointT>());
+        // 对输入点云cloud_keyframes_应用cloud_keyposes_6d_变换转换，保存到tf_cloud中
         tf_cloud = transformPointCloud(cloud_keyframes_[this_key_id], cloud_keyposes_6d_->points[this_key_id]);
-        recent_keyframes_.push_back(tf_cloud);
+        recent_keyframes_.push_back(tf_cloud);// push_back放在最后面，   lego_loam中是push_front放在最前面，在容器的开头添加元素，后面的else中是pop_front弹出最最前面的元素
         if (recent_keyframes_.size() >= surround_search_num_)
         {
           break;
@@ -323,13 +400,18 @@ void NDTMap::extractSurroundKeyframes()
       }
       target_updated = true;
     }
+    //将最新的点云叠加
+    // 2.否则pop_back()队列recent_keyframes_最后面的一个，再往队列前部（头部）push_front一个；
     else
     {
+        // static静态全局变量
       static int latest_frame_id = cloud_keyframes_.size() - 1;
+        // recent_keyframes_中点云保存的数量较多(>=surround_search_num_(50))
+        // pop队列最后面的一个，再push前面一个
       if (latest_frame_id != cloud_keyframes_.size() - 1)
       {
         latest_frame_id = cloud_keyframes_.size() - 1;
-        recent_keyframes_.pop_back();
+        recent_keyframes_.pop_back();// pop_back()
         pcl::PointCloud<PointT>::Ptr tf_cloud(new pcl::PointCloud<PointT>());
         tf_cloud = transformPointCloud(cloud_keyframes_[latest_frame_id], cloud_keyposes_6d_->points[latest_frame_id]);
         recent_keyframes_.push_front(tf_cloud);
@@ -337,22 +419,25 @@ void NDTMap::extractSurroundKeyframes()
       }
     }
   }
-  else
+  // 没有回环的情况，在这里是寻找附近点之后进行降维处理，
+  // 目的是让地图点云不要太过密集，最终将合适的点云累加起来，这是一个将新点云在线调整并叠加的过程。
+  else// 没有开启回环检测
   {
   }
 
   if (target_updated)
   {
-    pc_target_->clear();
-    for (auto keyframe : recent_keyframes_)
-    {
-      *pc_target_ += *keyframe;
-    }
-    cpu_ndt_.setInputTarget(pc_target_);
+//    pc_target_->clear();
+    // 遍历所有的recent_keyframes_，将其添加到pc_target中
+//    for (auto keyframe : recent_keyframes_)
+//    {
+//        *pc_target_ += *keyframe;
+//    }
+//    cpu_ndt_.setInputTarget(pc_target_);
     ROS_INFO("new ndt target set");
   }
 
-  if (pub_recent_keyframes_.getNumSubscribers() > 0)
+  if (pub_recent_keyframes_.getNumSubscribers() > 0)// 发布最近的关键帧点云"/recent_keyframes"
   {
     sensor_msgs::PointCloud2 msg;
     pcl::toROSMsg(*pc_target_, msg);
@@ -372,7 +457,7 @@ bool NDTMap::saveKeyframesAndFactor()
   // 此处的当前位姿(cur_pose_ndt_)为 ndt 匹配后的 final_transformation
   double roll, pitch, yaw;
   tf::Matrix3x3(tf::Quaternion(cur_pose_ndt_.pose.pose.orientation.x, cur_pose_ndt_.pose.pose.orientation.y, cur_pose_ndt_.pose.pose.orientation.z, cur_pose_ndt_.pose.pose.orientation.w)).getRPY(roll, pitch, yaw);
-  if (cloud_keyposes_3d_->points.empty())
+  if (cloud_keyposes_3d_->points.empty())// 第一帧点云数据输入
   {
     // gtSAMgraph_.add(PriorFactor<Pose3>(0, Pose3(Rot3::Quaternion(cur_pose_ndt_.pose.pose.orientation.w, cur_pose_ndt_.pose.pose.orientation.x, cur_pose_ndt_.pose.pose.orientation.y, cur_pose_ndt_.pose.pose.orientation.z), Point3(cur_pose_ndt_.pose.pose.position.x, cur_pose_ndt_.pose.pose.position.y, cur_pose_ndt_.pose.pose.position.z)), prior_noise_));
     gtSAMgraph_.add(PriorFactor<Pose3>(0, Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(cur_pose_ndt_.pose.pose.position.x, cur_pose_ndt_.pose.pose.position.y, cur_pose_ndt_.pose.pose.position.z)), prior_noise_));
@@ -381,15 +466,50 @@ bool NDTMap::saveKeyframesAndFactor()
   }
   else
   {
-    const auto &pre_pose = cloud_keyposes_6d_->points[cloud_keyposes_3d_->points.size() - 1];
-    if (std::pow(cur_pose_ndt_.pose.pose.position.x - pre_pose.x, 2) +
-            std::pow(cur_pose_ndt_.pose.pose.position.y - pre_pose.y, 2) +
-            std::pow(cur_pose_ndt_.pose.pose.position.z - pre_pose.z, 2) <
-        keyframe_dist_)
-    {
-      // too close
-      return false;
-    }
+      pcl::PointCloud<PointT>::Ptr pc_m(new pcl::PointCloud<PointT>());
+      pcl::transformPointCloud(*pc_source_, *pc_m, cur_pose_m_);
+      // Update voxel grid
+      // cpu_ndt_.updateVoxelGrid(pc_m);
+
+      // 加入到地图中
+      *pc_target_ += *pc_m;
+      // 加入地图的 帧 的位姿
+      if (_incremental_voxel_update == true)
+          cpu_ndt_.updateVoxelGrid(pc_m);// Update voxel grid
+      else
+          cpu_ndt_.setInputTarget(pc_target_);
+
+      double shift = sqrt(pow(current_pose.x - added_pose.x, 2.0) + pow(current_pose.y - added_pose.y, 2.0));
+      // 给定两帧距离
+      if (shift <= keyframe_dist_)// 0.3
+      {
+          // too close
+          return false;
+      }
+      added_pose.x = current_pose.x;
+      added_pose.y = current_pose.y;
+      added_pose.z = current_pose.z;
+      added_pose.roll = current_pose.roll;
+      added_pose.pitch = current_pose.pitch;
+      added_pose.yaw = current_pose.yaw;
+
+      PointTPose pre_pose;
+      pre_pose.x = added_pose.x;
+      pre_pose.y = added_pose.y;
+      pre_pose.z = added_pose.z;
+      pre_pose.roll = added_pose.roll;
+      pre_pose.pitch = added_pose.pitch;
+      pre_pose.yaw = added_pose.yaw;
+    // const auto &pre_pose = cloud_keyposes_6d_->points[cloud_keyposes_3d_->points.size() - 1];
+     std::cout << "cloud_keyposes_3d_->points.size(): " << cloud_keyposes_3d_->points.size() << std::endl;
+//    if (std::pow(cur_pose_ndt_.pose.pose.position.x - pre_pose.x, 2) +
+//            std::pow(cur_pose_ndt_.pose.pose.position.y - pre_pose.y, 2) +
+//            std::pow(cur_pose_ndt_.pose.pose.position.z - pre_pose.z, 2) <
+//        keyframe_dist_) // keyframe_dist_:0.3
+//    {
+//      // too close
+//      return false;
+//    }
 
     // gtsam::Pose3 pose_from = Pose3(Rot3::Quaternion(pre_keypose_.pose.pose.orientation.w, pre_keypose_.pose.pose.orientation.x, pre_keypose_.pose.pose.orientation.y, pre_keypose_.pose.pose.orientation.z), Point3(pre_keypose_.pose.pose.position.x, pre_keypose_.pose.pose.position.y, pre_keypose_.pose.pose.position.z));
     gtsam::Pose3 pose_from = Pose3(Rot3::RzRyRx(pre_pose.roll, pre_pose.pitch, pre_pose.yaw), Point3(pre_pose.x, pre_pose.y, pre_pose.z));
@@ -414,7 +534,8 @@ bool NDTMap::saveKeyframesAndFactor()
   this_pose_6d.x = this_pose_3d.x = latest_estimate.translation().x();
   this_pose_6d.y = this_pose_3d.y = latest_estimate.translation().y();
   this_pose_6d.z = this_pose_3d.z = latest_estimate.translation().z();
-  this_pose_6d.intensity = this_pose_3d.intensity = cloud_keyposes_3d_->points.size();
+  // intensity表示的是关键帧的
+  this_pose_6d.intensity = this_pose_3d.intensity = cloud_keyposes_3d_->points.size();// intensity直接等于size()大小
   this_pose_6d.roll = latest_estimate.rotation().roll();
   this_pose_6d.pitch = latest_estimate.rotation().pitch();
   this_pose_6d.yaw = latest_estimate.rotation().yaw();
@@ -461,6 +582,7 @@ bool NDTMap::saveKeyframesAndFactor()
 
 void NDTMap::publishKeyposesAndFrames()
 {
+    // "/keyposes"
   if (pub_keyposes_.getNumSubscribers() > 0)
   {
     sensor_msgs::PointCloud2 msg;
@@ -469,6 +591,7 @@ void NDTMap::publishKeyposesAndFrames()
     msg.header.stamp = ros::Time::now();
     pub_keyposes_.publish(msg);
   }
+  // "/laser_cloud_surround"
   if (pub_laser_cloud_surround_.getNumSubscribers() > 0)
   {
     int num_points = 0;
@@ -499,36 +622,47 @@ void NDTMap::odomCB(const nav_msgs::OdometryConstPtr &msg)
   }
   odom_queue_[odom_ptr_last_] = *msg;
 }
-
+// 激光雷达数据/velodyne_points回调函数  pointCloud_CallBack
 void NDTMap::pcCB(const sensor_msgs::PointCloud2ConstPtr &msg)
 {
-  std::lock_guard<std::mutex> lock(mtx_);
-  auto start = std::chrono::system_clock::now();
+    // lock_guard 自动加锁、解锁。原理是 RAII，和智能指针类似。
+  // std::lock_guard<std::mutex> lock(mtx_);// 线程锁
+  auto start = std::chrono::system_clock::now();// 开始的时间
 
-  extractSurroundKeyframes();
+  ros::Time current_scan_time = msg->header.stamp;
+  static ros::Time previous_scan_time = current_scan_time;
+
+    Eigen::Matrix4f t_base_link(Eigen::Matrix4f::Identity());
+
+    // 抽取周围关键帧
+  // extractSurroundKeyframes();// 提取附近点云作为 target map进行NDT匹配。 *pc_target_ += *keyframe (recent_keyframes_所有点云)
 
   // 去运动畸变，距离和 voxel 滤波
   pcl::PointCloud<PointT>::Ptr tmp_cloud(new pcl::PointCloud<PointT>());
 
   pc_source_->clear();
   pcl::fromROSMsg(*msg, *tmp_cloud);
-  // 点云转换到 /base_link 坐标系中处理
+  // 点云由/localizer坐标系 转换到 /base_link 坐标系中处理，
+  // 进来的点云数据直接转换到/base_link坐标系下面
   pcl::transformPointCloud(*tmp_cloud, *pc_source_, tf_b2l_);
 
-  if (use_imu_)
+  if (use_imu_)// 使用IMU数据去点云畸变
   {
-    adjustDistortion(pc_source_, msg->header.stamp.toSec());
+    adjustDistortion(pc_source_, msg->header.stamp.toSec());// 基于LOAM的匀加速运动假设，使用IMU去畸变
   }
 
+  // volex降采样
   tmp_cloud->clear();
   ROS_INFO("before ds: %d points", pc_source_->points.size());
   voxel_filter_.setInputCloud(pc_source_);
   voxel_filter_.filter(*tmp_cloud);
   pc_source_->clear();
+
   float r;
-  for (const auto &p : tmp_cloud->points)
+  for (const auto &p : tmp_cloud->points) // 保留指定距离内的点
   {
     r = p.x * p.x + p.y * p.y;
+    // 最大最小距离是100, 2米
     if (r > min_scan_range_ && r < max_scan_range_)
     {
       pc_source_->points.push_back(p);
@@ -537,92 +671,103 @@ void NDTMap::pcCB(const sensor_msgs::PointCloud2ConstPtr &msg)
   ROS_INFO("after ds: %d points", pc_source_->points.size());
 
   // 第一帧点云，存为 target，初始化起始位置
-  if (cloud_keyframes_.empty())
+  if (cloud_keyframes_.empty()) // 也可以用一个flag表示initial_scan_loaded, is_first_map
   {
     ROS_INFO("first laser frame.");
     *pc_target_ += *pc_source_;
-    cpu_ndt_.setInputTarget(pc_target_);
-    if (use_odom_ && odom_ptr_last_ != -1)
-    {
-      int odom_ptr = odom_ptr_front_;
-      while (odom_ptr != odom_ptr_last_)
-      {
-        if (odom_queue_[odom_ptr].header.stamp > msg->header.stamp)
-        {
-          break;
-        }
-        odom_ptr = (odom_ptr + 1) % imu_queue_len_;
-      }
-      pre_pose_o_.block<3, 3>(0, 0) = Eigen::Quaternionf(odom_queue_[odom_ptr].pose.pose.orientation.w, odom_queue_[odom_ptr].pose.pose.orientation.x, odom_queue_[odom_ptr].pose.pose.orientation.y, odom_queue_[odom_ptr].pose.pose.orientation.z).toRotationMatrix();
-      pre_pose_o_(0, 3) = odom_queue_[odom_ptr].pose.pose.position.x;
-      pre_pose_o_(1, 3) = odom_queue_[odom_ptr].pose.pose.position.y;
-      pre_pose_o_(2, 3) = odom_queue_[odom_ptr].pose.pose.position.z;
-      cur_pose_o_ = pre_pose_o_;
-      odom_ptr_front_ = odom_ptr; // 更新指针
-    }
+    // 第一帧的时候，直接设置为InputTarget
+    cpu_ndt_.setInputTarget(pc_target_);// ndt输入的target点云数据
   }
 
-  nav_msgs::Odometry predict_msg;
-  // 配准初始位姿估计
-  if (use_odom_ && odom_ptr_last_ != -1)
-  {
-    pre_pose_o_ = cur_pose_o_;
-    int odom_ptr = odom_ptr_front_;
-    while (odom_ptr != odom_ptr_last_)
-    {
-      if (odom_queue_[odom_ptr].header.stamp > msg->header.stamp)
-      {
-        break;
-      }
-      odom_ptr = (odom_ptr + 1) % imu_queue_len_;
-    }
-    cur_pose_o_.block<3, 3>(0, 0) = Eigen::Quaternionf(odom_queue_[odom_ptr].pose.pose.orientation.w, odom_queue_[odom_ptr].pose.pose.orientation.x, odom_queue_[odom_ptr].pose.pose.orientation.y, odom_queue_[odom_ptr].pose.pose.orientation.z).toRotationMatrix();
-    cur_pose_o_(0, 3) = odom_queue_[odom_ptr].pose.pose.position.x;
-    cur_pose_o_(1, 3) = odom_queue_[odom_ptr].pose.pose.position.y;
-    cur_pose_o_(2, 3) = odom_queue_[odom_ptr].pose.pose.position.z;
-    odom_ptr_front_ = odom_ptr; // 更新指针
 
-    Eigen::Quaternionf tmp_q(pre_pose_m_.block<3, 3>(0, 0));
-    double roll, pitch, yaw;
-    tf::Matrix3x3(tf::Quaternion(tmp_q.x(), tmp_q.y(), tmp_q.z(), tmp_q.w())).getRPY(roll, pitch, yaw);
-    pre_pose_m_.block<3, 3>(0, 0) = Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()).toRotationMatrix();
 
-    Eigen::Matrix4f r_m2o = Eigen::Matrix4f::Identity();
-    r_m2o.block<3, 3>(0, 0) = Eigen::Quaternionf(tf_m2o_.getRotation().w(), tf_m2o_.getRotation().x(), tf_m2o_.getRotation().y(), tf_m2o_.getRotation().z()).toRotationMatrix();
-    cur_pose_m_ = pre_pose_m_ * pre_pose_o_.inverse() * cur_pose_o_; // 见笔记“预测当前位姿”
-
-    tmp_q = Eigen::Quaternionf(cur_pose_m_.block<3, 3>(0, 0));
-    tf::Matrix3x3(tf::Quaternion(tmp_q.x(), tmp_q.y(), tmp_q.z(), tmp_q.w())).getRPY(roll, pitch, yaw);
-    std::cout << "initial guess: "
-              << "(" << cur_pose_m_(0, 3) << ", " << cur_pose_m_(1, 3) << ", " << cur_pose_m_(2, 3) << ", " << roll
-              << ", " << pitch << ", " << yaw << ")" << std::endl;
-    predict_msg.header.stamp = msg->header.stamp;
-    predict_msg.header.frame_id = "map";
-    predict_msg.pose.pose.position.x = cur_pose_m_(0, 3);
-    predict_msg.pose.pose.position.y = cur_pose_m_(1, 3);
-    predict_msg.pose.pose.position.z = cur_pose_m_(2, 3);
-    predict_msg.pose.pose.orientation.w = tmp_q.w();
-    predict_msg.pose.pose.orientation.x = tmp_q.x();
-    predict_msg.pose.pose.orientation.y = tmp_q.y();
-    predict_msg.pose.pose.orientation.z = tmp_q.z();
-    pub_predict_pose_.publish(predict_msg);
-  }
-  else
+    // nav_msgs::Odometry predict_msg;// 预测的位姿数据
+  // 配准初始位姿估计， 使用odometer的情况下
+ // 不使用odometer的情况下
   {
     // TODO: 改进
-    predict_pose_ = pre_pose_ndt_;
-    cur_pose_m_ = pre_pose_m_;
+//    predict_pose_ = pre_pose_ndt_;
+//    cur_pose_m_ = pre_pose_m_;
+
+      // 初始pose,不使用odometer，的预测值
+      guess_pose.x = previous_pose.x + diff_x; // 初始位姿 = 上一帧t-1的位姿 + (t-1  -  t-2)的位姿差
+      guess_pose.y = previous_pose.y + diff_y;
+      guess_pose.z = previous_pose.z + diff_z;
+      guess_pose.roll = previous_pose.roll; // 横摆角
+      guess_pose.pitch = previous_pose.pitch;// 俯仰角
+      guess_pose.yaw = previous_pose.yaw + diff_yaw;// 平面上运动，近似只有偏航角变化
+
+      pose guess_pose_for_ndt;
+      guess_pose_for_ndt = guess_pose;
+    //  欧拉角->旋转向量
+      Eigen::AngleAxisf init_rotation_x(guess_pose_for_ndt.roll, Eigen::Vector3f::UnitX());//沿X轴转roll
+      Eigen::AngleAxisf init_rotation_y(guess_pose_for_ndt.pitch, Eigen::Vector3f::UnitY());
+      Eigen::AngleAxisf init_rotation_z(guess_pose_for_ndt.yaw, Eigen::Vector3f::UnitZ());
+
+      Eigen::Translation3f init_translation(guess_pose_for_ndt.x, guess_pose_for_ndt.y, guess_pose_for_ndt.z);
+    //  旋转向量->初始的变换矩阵 角度*模长
+      Eigen::Matrix4f init_guess = // (translation(x,y,z) * rz * ry * rx)*上一帧的激光雷达lidar到世界坐标系map的变换
+              //(init_translation * init_rotation_z * init_rotation_y * init_rotation_x).matrix() * tf_btol;
+              (init_translation * init_rotation_z * init_rotation_y * init_rotation_x).matrix();
+
+      cur_pose_m_ = init_guess;
   }
 
   // ndt 匹配迭代
-  cpu_ndt_.setInputSource(pc_source_);
-  cpu_ndt_.align(cur_pose_m_);
-  fitness_score_ = cpu_ndt_.getFitnessScore();
-  final_transformation_ = cpu_ndt_.getFinalTransformation();
-  has_converged_ = cpu_ndt_.hasConverged();
-  final_iters_ = cpu_ndt_.getFinalNumIteration();
+  cpu_ndt_.setInputSource(pc_source_); // 这里的pc_source是/base_link坐标系下的
+  cpu_ndt_.align(cur_pose_m_);//开始配准
+  fitness_score_ = cpu_ndt_.getFitnessScore();//配准得分
+  // T_{map, base_link}最开始就进行了localizer到base_link的转换
+  final_transformation_ = cpu_ndt_.getFinalTransformation();//配准成功得到的变换矩阵
+  has_converged_ = cpu_ndt_.hasConverged();// 是否收敛
+  final_iters_ = cpu_ndt_.getFinalNumIteration();//最终迭代次数
 
-  Eigen::Quaternionf tmp_q(final_transformation_.block<3, 3>(0, 0));
+    t_base_link = final_transformation_;
+    tf::Matrix3x3 mat_b;//相邻帧、相对于全局的旋转矩阵
+    mat_b.setValue(static_cast<double>(t_base_link(0, 0)), static_cast<double>(t_base_link(0, 1)),
+                   static_cast<double>(t_base_link(0, 2)), static_cast<double>(t_base_link(1, 0)),
+                   static_cast<double>(t_base_link(1, 1)), static_cast<double>(t_base_link(1, 2)),
+                   static_cast<double>(t_base_link(2, 0)), static_cast<double>(t_base_link(2, 1)),
+                   static_cast<double>(t_base_link(2, 2)));
+    // Update ndt_pose.   T_{map, base_link} base_link到map的转换
+    ndt_pose.x = t_base_link(0, 3);
+    ndt_pose.y = t_base_link(1, 3);
+    ndt_pose.z = t_base_link(2, 3);
+    mat_b.getRPY(ndt_pose.roll, ndt_pose.pitch, ndt_pose.yaw, 1);
+
+    current_pose.x = ndt_pose.x;
+    current_pose.y = ndt_pose.y;
+    current_pose.z = ndt_pose.z;
+    current_pose.roll = ndt_pose.roll;
+    current_pose.pitch = ndt_pose.pitch;
+    current_pose.yaw = ndt_pose.yaw;
+
+    //  计算两帧时间
+    scan_duration = current_scan_time - previous_scan_time;
+    double secs = scan_duration.toSec();
+
+    // Calculate the offset (curren_pos - previous_pos)计算两帧之间的位移、速度和偏航角变化
+    diff_x = current_pose.x - previous_pose.x;
+    diff_y = current_pose.y - previous_pose.y;
+    diff_z = current_pose.z - previous_pose.z;
+    diff_yaw = calcDiffForRadian(current_pose.yaw, previous_pose.yaw); // 前后偏航角差
+    diff = sqrt(diff_x * diff_x + diff_y * diff_y + diff_z * diff_z);
+
+    // Update position and posture. current_pos -> previous_pos 更新当前位姿
+    previous_pose.x = current_pose.x;
+    previous_pose.y = current_pose.y;
+    previous_pose.z = current_pose.z;
+    previous_pose.roll = current_pose.roll;
+    previous_pose.pitch = current_pose.pitch;
+    previous_pose.yaw = current_pose.yaw;
+
+    previous_scan_time.sec = current_scan_time.sec;
+    previous_scan_time.nsec = current_scan_time.nsec;
+
+
+
+
+  Eigen::Quaternionf tmp_q(final_transformation_.block<3, 3>(0, 0));// ndt最终的最终的旋转位姿
   double roll, pitch, yaw;
   tf::Matrix3x3(tf::Quaternion(tmp_q.x(), tmp_q.y(), tmp_q.z(), tmp_q.w())).getRPY(roll, pitch, yaw);
 
@@ -641,24 +786,37 @@ void NDTMap::pcCB(const sensor_msgs::PointCloud2ConstPtr &msg)
   updated_msg.pose = cur_pose_ndt_.pose;
   pub_updated_pose_.publish(updated_msg);
 
-  tf::Transform tf_m2b;
+  tf::Transform tf_m2b;// map-->base_link
+  // T_{map, base_link}
   tf_m2b.setOrigin(tf::Vector3(final_transformation_(0, 3), final_transformation_(1, 3), final_transformation_(2, 3)));
   tf_m2b.setRotation(tf::Quaternion(tmp_q.x(), tmp_q.y(), tmp_q.z(), tmp_q.w()));
-  if (use_odom_ && odom_ptr_last_ != -1)
+//  if (use_odom_ && odom_ptr_last_ != -1)//使用odometer
+//  {
+//    tf_o2b_.setOrigin(tf::Vector3(odom_queue_[odom_ptr_front_].pose.pose.position.x, odom_queue_[odom_ptr_front_].pose.pose.position.y, odom_queue_[odom_ptr_front_].pose.pose.position.z));
+//    tf_o2b_.setRotation(tf::Quaternion(odom_queue_[odom_ptr_front_].pose.pose.orientation.x, odom_queue_[odom_ptr_front_].pose.pose.orientation.y, odom_queue_[odom_ptr_front_].pose.pose.orientation.z, odom_queue_[odom_ptr_front_].pose.pose.orientation.w));
+//    // map-->odom = map-->base_link * base_link-->odom = map-->base_link * odom-->base_link.inverse()
+//    tf_m2o_ = tf_m2b * tf_o2b_.inverse();
+//    // tf::StampedTransform tmp;
+//    // tf_listener_.waitForTransform("/odom", "/base_link", ros::Time(0), ros::Duration(0.05));
+//    // tf_listener_.lookupTransform("/odom", "/base_link", ros::Time(0), tmp);
+//    // tf_m2o_ = tf_m2b * tmp.inverse();
+//    tf_broadcaster_.sendTransform(tf::StampedTransform(tf_m2o_, msg->header.stamp, "map", "/odom"));
+//  }
+//  else
   {
-    tf_o2b_.setOrigin(tf::Vector3(odom_queue_[odom_ptr_front_].pose.pose.position.x, odom_queue_[odom_ptr_front_].pose.pose.position.y, odom_queue_[odom_ptr_front_].pose.pose.position.z));
-    tf_o2b_.setRotation(tf::Quaternion(odom_queue_[odom_ptr_front_].pose.pose.orientation.x, odom_queue_[odom_ptr_front_].pose.pose.orientation.y, odom_queue_[odom_ptr_front_].pose.pose.orientation.z, odom_queue_[odom_ptr_front_].pose.pose.orientation.w));
-    tf_m2o_ = tf_m2b * tf_o2b_.inverse();
-    // tf::StampedTransform tmp;
-    // tf_listener_.waitForTransform("/odom", "/base_link", ros::Time(0), ros::Duration(0.05));
-    // tf_listener_.lookupTransform("/odom", "/base_link", ros::Time(0), tmp);
-    // tf_m2o_ = tf_m2b * tmp.inverse();
-    tf_broadcaster_.sendTransform(tf::StampedTransform(tf_m2o_, msg->header.stamp, "map", "/odom"));
-  }
-  else
-  {
+  	// 发布map-->base_link的
     tf_broadcaster_.sendTransform(tf::StampedTransform(tf_m2b, msg->header.stamp, "map", "/base_link"));
   }
+
+
+    if (saveKeyframesAndFactor())
+    {
+
+    }
+    else
+    {
+        std::cout << "too close" << std::endl;
+    }
 
   auto end = std::chrono::system_clock::now();
   std::chrono::duration<double> elapsed = end - start;
@@ -677,23 +835,21 @@ void NDTMap::pcCB(const sensor_msgs::PointCloud2ConstPtr &msg)
   std::cout << "shift: " << std::sqrt(std::pow(final_transformation_(0, 3) - pre_pose_m_(0, 3), 2) + std::pow(final_transformation_(1, 3) - pre_pose_m_(1, 3), 2) + std::pow(final_transformation_(2, 3) - pre_pose_m_(2, 3), 2)) << std::endl;
   std::cout << "-----------------------------------------------------------------" << std::endl;
 
-  if (saveKeyframesAndFactor())
-  {
-    pcl::PointCloud<PointT>::Ptr pc_m(new pcl::PointCloud<PointT>());
-    pcl::transformPointCloud(*pc_source_, *pc_m, cur_pose_m_);
-    cpu_ndt_.updateVoxelGrid(pc_m);
-  }
-  else
-  {
-    std::cout << "too close" << std::endl;
-  }
+  // 4. 每n米更新一次全局地图，同时使用单独的线程,按照一定的频率进行地图的保存。// 这里是0.3米
+//    pcl::PointCloud<PointT>::Ptr pc_map(new pcl::PointCloud<PointT>());
+//    pcl::transformPointCloud(*pc_source_, *pc_map, cur_pose_m_);
+//    *pc_target_ += *pc_map;
+//    cpu_ndt_.setInputTarget(pc_target_);
+
+
 
   pre_pose_m_ = cur_pose_m_;
   pre_pose_ndt_ = cur_pose_ndt_;
 
-  correctPoses();
+  // 通过判断loop_closed_标志来检测是否有回环出现
+  correctPoses();// 检测出回环后，更新位姿及 target map
 }
-
+// IMU消息回调函数
 void NDTMap::imuCB(const sensor_msgs::ImuConstPtr &msg)
 {
   double roll, pitch, yaw;
@@ -966,40 +1122,43 @@ void NDTMap::correctPoses()
     loop_closed_ = false;
   }
 }
-
+// "/save_map"保存地图的service
 bool NDTMap::saveMapCB(std_srvs::Empty::Request &req, std_srvs::Empty::Response &res)
 {
   std::stringstream ss;
   ss << int(ros::Time::now().toSec());
-  std::string stamp = ss.str();
+  std::string stamp = ss.str();// 保存当前ROS时间的string字符串
 
   int num_points = 0, num_points1 = 0;
-  pcl::PointCloud<PointT>::Ptr map(new pcl::PointCloud<PointT>());
-  pcl::PointCloud<PointT>::Ptr map_no_ground(new pcl::PointCloud<PointT>());
+  pcl::PointCloud<PointT>::Ptr map(new pcl::PointCloud<PointT>());// 有地面的map地图
+  pcl::PointCloud<PointT>::Ptr map_no_ground(new pcl::PointCloud<PointT>());// 没有地面的地图map
   for (int i = 0; i < cloud_keyframes_.size(); ++i)
   {
     pcl::PointCloud<PointT>::Ptr tmp(new pcl::PointCloud<PointT>());
+    // cloud_keyframes_关键帧点云，及其位姿xyz,rpy,time
+    // 根据位姿，将点云进行转换，转换后的点云保存到tmp中
     tmp = transformPointCloud(cloud_keyframes_[i], cloud_keyposes_6d_->points[i]);
     *map += *tmp;
-    num_points += tmp->points.size();
+    num_points += tmp->points.size();// 统计map点云的大小
 
     pcl::PointCloud<PointT>::Ptr tmp1(new pcl::PointCloud<PointT>());
+    // utils::RayGroundFilter ground_filter;去除clip_height高度以上的点云
     ground_filter.convert(cloud_keyframes_[i], tmp1);
     tmp1 = transformPointCloud(tmp1, cloud_keyposes_6d_->points[i]);
     *map_no_ground += *tmp1;
-    num_points1 += tmp1->points.size();
+    num_points1 += tmp1->points.size();// 统计map_no_ground点云的大小
   }
 
-  map->width = map->points.size();
+  map->width = map->points.size(); // map的点云数量
   map->height = 1;
   map->is_dense = false;
 
-  map_no_ground->width = map_no_ground->points.size();
+  map_no_ground->width = map_no_ground->points.size();// map_no_ground的大小
   map_no_ground->height = 1;
   map_no_ground->is_dense = false;
 
   pcl::PointCloud<PointT>::Ptr poses(new pcl::PointCloud<PointT>());
-  pcl::copyPointCloud(*cloud_keyposes_3d_, *poses);
+  pcl::copyPointCloud(*cloud_keyposes_3d_, *poses);// 位姿，xyz
   poses->width = poses->points.size();
   poses->height = 1;
   poses->is_dense = false;

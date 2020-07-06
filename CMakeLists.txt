@@ -18,7 +18,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf
   ndt_gpu
   ndt_cpu
-  utils
+  #utils
 )
 
 find_package(PCL REQUIRED)

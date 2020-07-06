@@ -10,7 +10,7 @@ int main(int argc, char **argv)
   std::thread visual_thread(&NDTMap::visualThread, map);
   std::thread loop_thread(&NDTMap::loopClosureThread, map);
 
-  map->run();
+  // map->run(); // void NDTMap::run() {}空的函数,没用
 
   ros::spin();
 
